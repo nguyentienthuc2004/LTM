@@ -7,7 +7,7 @@ import java.util.concurrent.ThreadLocalRandom;
 
 public class Client {
     public static void main(String[] args) throws Exception {
-        String broker = "ssl://0ac901938c97430b9bde1e30ea590141.s1.eu.hivemq.cloud:8883";
+        String broker = "ssl://8e35c2a9c7114b3f9649e7a3e2e982e3.s1.eu.hivemq.cloud:8883";
         String username = "thucng04";
         String password = "Anhthucdz1";
         String topic = "ltm";
@@ -37,8 +37,8 @@ public class Client {
             if (currentTemp < 20) currentTemp = 20;
             if (currentTemp > 35) currentTemp = 35;
 
-            // Giả lập spike: 3% khả năng tăng/giảm mạnh (ví dụ khi sensor bị nhiễu hoặc môi trường thay đổi)
-            if (rnd.nextInt(0, 33) == 0) {
+            // Giả lập spike: 3% khả năng tăng/giảm mạnh
+            if (rnd.nextInt(0, 35) == 0) {
                 double spike = rnd.nextDouble(2, 5);
                 currentTemp += rnd.nextBoolean() ? spike : -spike;
                 System.out.println("⚠️ Spike event!");
@@ -49,11 +49,11 @@ public class Client {
             payload.addProperty("temperature", currentTemp);
             payload.addProperty("time", System.currentTimeMillis());
 
-            // Gửi lên MQTT topic
-            mqttClient.publish(topic, new MqttMessage(payload.toString().getBytes()));
+            MqttMessage message = new MqttMessage(payload.toString().getBytes());
+            message.setQos(0); // Gửi nhanh, không cần xác nhận
+            mqttClient.publish(topic, message); // không chờ ACK
             System.out.println("📤 Sent: " + payload);
 
-            Thread.sleep(500); // gửi mỗi 0.5 giây
         }
     }
 }
