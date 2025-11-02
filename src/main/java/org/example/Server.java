@@ -18,27 +18,21 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * Server demo for Backpressure / Buffer overflow.
- *
- * Improvements:
- * - Offload all WebSocket broadcast + control publish into broadcastExecutor
- *   so messageArrived (MQTT callback thread) is never blocked by slow WS clients.
- * - messageArrived now does: parse -> quick log -> enqueue -> submit snapshot task.
- * - Control (ltm/slow, ltm/normal) publishing is also done from broadcastExecutor.
+ * Server xử lý dữ liệu giá từ MQTT ("ltm" topic).
+ * Chỉ sửa: xử lý "price" thay vì "temperature". Giữ nguyên format trả về.
+ * Bỏ trường "alert".
  */
 public class Server {
     // Configurable parameters
-    private static final int BUFFER_CAPACITY = 4000;
+    private static final int BUFFER_CAPACITY = 400;
     private static final int THROTTLE_THRESHOLD = BUFFER_CAPACITY * 80 / 100;
     private static final int RESUME_THRESHOLD = BUFFER_CAPACITY * 40 / 100;
-    private static final long QUEUE_OFFER_TIMEOUT_MS = 50;
-    private static final long WINDOW_SECONDS=5;
-    private static final long minTemp = 15;
-    private static final long maxTemp = 30;
+    private static final long WINDOW_SECONDS = 5;
+
     private final BroadcastWebSocket wsServer;
     private final MqttClient mqttClient;
 
-    // inbound queue
+    // inbound queue (giữ giá dưới dạng Double)
     private final ArrayBlockingQueue<Double> inboundQueue = new ArrayBlockingQueue<>(BUFFER_CAPACITY);
 
     // counters
@@ -70,7 +64,7 @@ public class Server {
 
         mqttClient = new MqttClient(
                 mqttUrl,
-                "temp-server-" + ThreadLocalRandom.current().nextInt(10000),
+                "price-server-" + ThreadLocalRandom.current().nextInt(10000),
                 new MemoryPersistence()
         );
 
@@ -85,14 +79,13 @@ public class Server {
             @Override
             public void connectionLost(Throwable cause) {
                 System.err.println("⚠️ MQTT connection lost: " + (cause != null ? cause.getMessage() : "unknown"));
-                // Offload WS broadcast to avoid blocking MQTT thread
                 broadcastExecutor.execute(() -> {
-                    JsonObject s = new JsonObject();
-                    s.addProperty("type", "system");
-                    s.addProperty("systemStatus", "MQTT_DISCONNECTED");
-                    s.addProperty("message", "MQTT connection lost");
-                    s.addProperty("timestamp", System.currentTimeMillis());
-                    wsServer.broadcastJson(s);
+                    JsonObject evt = new JsonObject();
+                    evt.addProperty("type", "system");
+                    evt.addProperty("systemStatus", "MQTT_DISCONNECTED");
+                    evt.addProperty("message", "MQTT connection lost");
+                    evt.addProperty("timestamp", System.currentTimeMillis());
+                    wsServer.broadcastJson(evt);
                 });
             }
 
@@ -104,25 +97,27 @@ public class Server {
 
                     String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
                     JsonObject json = JsonParser.parseString(payload).getAsJsonObject();
-                    if (!json.has("temperature")) return;
+                    if (!json.has("price")) return;
 
-                    double temp = json.get("temperature").getAsDouble();
-                    long time = json.has("time") ? json.get("time").getAsLong() : Instant.now().toEpochMilli();
+                    double price = json.get("price").getAsDouble();
+                    String symbol = json.has("symbol") ? json.get("symbol").getAsString() : "UNKNOWN";
+                    long time = json.has("timestamp") ? json.get("timestamp").getAsLong() : Instant.now().toEpochMilli();
 
-                    // QUICK: in log (cheap) — so you always see realtime current in console
-                    System.out.printf("📩 [CURRENT] temperature=%.2f°C time=%d systemStatus=%s buffer=%d/%d overflows=%d%n",
-                            temp, time, throttledState.get() == 1 ? "PAUSED" : "RUNNING",
+                    // QUICK: in log (cheap) — để thấy giá realtime trên console
+                    System.out.printf("📩 [PRICE] %s = %.6f | time=%d | state=%s | buffer=%d/%d | overflows=%d%n",
+                            symbol, price, time, throttledState.get() == 1 ? "PAUSED" : "RUNNING",
                             inboundQueue.size(), BUFFER_CAPACITY, overflowCount.get());
 
                     // QUICK: build minimal current object (we won't block on broadcasting)
                     JsonObject current = new JsonObject();
                     current.addProperty("type", "current");
-                    current.addProperty("temperature", temp);
+                    current.addProperty("symbol", symbol);
+                    current.addProperty("price", price);
                     current.addProperty("time", time);
                     current.addProperty("systemStatus", throttledState.get() == 1 ? "PAUSED" : "RUNNING");
 
                     // Try to insert into queue quickly (non-blocking)
-                    boolean offered = inboundQueue.offer(temp);
+                    boolean offered = inboundQueue.offer(price);
                     if (!offered) {
                         int o = overflowCount.incrementAndGet();
                         System.err.println("🔥 Queue overflow! sample dropped. totalOverflows=" + o);
@@ -148,8 +143,7 @@ public class Server {
 
                     // If enqueued successfully: check buffer size immediately and possibly trigger throttling.
                     int bufferNow = inboundQueue.size();
-                    boolean nowThrottled = bufferNow >= THROTTLE_THRESHOLD;
-                    if (nowThrottled && throttledState.compareAndSet(0, 1)) {
+                    if (bufferNow >= THROTTLE_THRESHOLD && throttledState.compareAndSet(0, 1)) {
                         // Offload control publish + broadcast
                         JsonObject ctrl = new JsonObject();
                         ctrl.addProperty("type", "slow");
@@ -214,8 +208,8 @@ public class Server {
                 try {
                     while (!Thread.currentThread().isInterrupted() && !emitter.isCancelled()) {
                         Double v = inboundQueue.take(); // blocks
+                        // simulate processing latency
                         Thread.sleep(5);
-                        // simulate processing
                         emitter.onNext(v);
 
                         // after consuming, check resume condition
@@ -253,7 +247,7 @@ public class Server {
             });
         }, BackpressureStrategy.MISSING);
 
-        // keep 5s window stats for aggregated metrics (unchanged)
+        // keep 5s window stats for aggregated metrics
         stream
                 .observeOn(Schedulers.computation())
                 .window(WINDOW_SECONDS, TimeUnit.SECONDS)
@@ -261,7 +255,7 @@ public class Server {
                 .filter(list -> !list.isEmpty())
                 .observeOn(Schedulers.computation())
                 .subscribe(list -> {
-                    // compute stats
+                    // compute stats on price values
                     double avg = list.stream().mapToDouble(Double::doubleValue).average().orElse(0);
                     double max = list.stream().mapToDouble(Double::doubleValue).max().orElse(0);
                     double min = list.stream().mapToDouble(Double::doubleValue).min().orElse(0);
@@ -270,9 +264,8 @@ public class Server {
                     double rate = (last - list.get(0)) / WINDOW_SECONDS;
                     int count = list.size();
                     double throughput = count / WINDOW_SECONDS;
-                    boolean alert = avg > maxTemp || avg < minTemp;
 
-                    // realtime fields (take current state immediately)
+                    // realtime fields
                     int bufferNow = inboundQueue.size();
                     boolean throttled = throttledState.get() == 1;
                     int totalOver = overflowCount.get();
@@ -287,7 +280,6 @@ public class Server {
                     stats.addProperty("rate", rate);
                     stats.addProperty("count", count);
                     stats.addProperty("throughput", throughput);
-                    stats.addProperty("alert", alert);
 
                     // realtime values included
                     stats.addProperty("throttled", throttled);
@@ -298,8 +290,8 @@ public class Server {
 
                     wsServer.broadcastJson(stats);
 
-                    System.out.printf("📊 [5s Stats] avg=%.2f°C max=%.2f°C min=%.2f°C Δ=%.2f°C rate=%.2f°C/s count=%d buffer=%d/%d throttled=%b overflows=%d%n",
-                            avg, max, min, fluctuation, rate, count, bufferNow, BUFFER_CAPACITY, throttled, totalOver);
+                    System.out.printf("📊 [5s Stats] avg=%.6f max=%.6f min=%.6f Δ=%.6f count=%d buffer=%d/%d throttled=%b overflows=%d%n",
+                            avg, max, min, fluctuation, count, bufferNow, BUFFER_CAPACITY, throttled, totalOver);
                 }, err -> {
                     System.err.println("❌ Stream error: " + err);
                     err.printStackTrace();
@@ -314,6 +306,6 @@ public class Server {
                 "Anhthucdz1"
         );
         server.start();
-        System.out.println("🚀 Server running. Press Ctrl+C to stop.");
+        System.out.println("🚀 Price server running...");
     }
 }
